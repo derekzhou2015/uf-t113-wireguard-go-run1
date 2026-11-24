@@ -208,6 +208,40 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 	return nil
 }
 
+// receivedInitiations remembers the handshake initiations this peer has already
+// consumed, as fingerprints of the fields that make up a transcript. It is used
+// to tell a byte-for-byte replay (which must stay rejected) apart from a fresh
+// initiation whose timestamp went backwards because the sender's wall clock
+// stepped back.
+//
+// The fingerprints are 64-bit truncations of a BLAKE2s-256 hash of the fields
+// that identify the transcript. Storing 8 bytes per entry rather than the full
+// 32 keeps the per-peer cost at 256 bytes, which matters because a device may
+// hold MaxPeers peers. A collision could only cause a legitimate initiation to
+// be rejected, and with 32 entries the odds are negligible.
+type receivedInitiations struct {
+	fingerprints [initiationDigestRingSize]uint64
+	next         int
+	count        int
+}
+
+func (r *receivedInitiations) record(fingerprint uint64) {
+	r.fingerprints[r.next] = fingerprint
+	r.next = (r.next + 1) % initiationDigestRingSize
+	if r.count < initiationDigestRingSize {
+		r.count++
+	}
+}
+
+func (r *receivedInitiations) contains(fingerprint uint64) bool {
+	for i := 0; i < r.count; i++ {
+		if r.fingerprints[i] == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
 type Handshake struct {
 	state                     handshakeState
 	mutex                     sync.RWMutex
@@ -223,6 +257,40 @@ type Handshake struct {
 	lastTimestamp             tai64n.Timestamp
 	lastInitiationConsumption time.Time
 	lastSentHandshake         time.Time
+	// lastSentTimestamp is the last initiation timestamp sent to this peer. It
+	// is deliberately kept across Clear so that a backward wall clock step
+	// cannot make us emit a timestamp the peer already considers a replay.
+	lastSentTimestamp tai64n.Timestamp
+	received          receivedInitiations
+	// clockRollback is set while we are accepting initiations whose timestamps
+	// sit below the high-water mark, because the peer's wall clock stepped
+	// backwards. It exists to report the anomaly once per episode rather than
+	// once per retransmission, and to tell recovery apart from steady state.
+	clockRollback bool
+	// clockRollbackSent is the initiator-side counterpart: it is set while our
+	// own clock is behind the last timestamp we sent, so that we extrapolate
+	// instead of re-sending a timestamp the peer has seen.
+	clockRollbackSent bool
+}
+
+// initiationFingerprint identifies an initiation by the fields that determine
+// which transcript it belongs to. MAC1/MAC2 are left out: they are deterministic
+// functions of these fields (plus per-device state and the source address), so
+// a replay of the same initiation always hashes the same here.
+func initiationFingerprint(msg *MessageInitiation) uint64 {
+	// BLAKE2s-128 requires a key, and the alternative (a fixed key baked into
+	// the binary) buys nothing here: the fingerprint only has to be a stable,
+	// collision-resistant tag for a transcript we have already authenticated.
+	hash, _ := blake2s.New256(nil)
+	var sender [4]byte
+	binary.LittleEndian.PutUint32(sender[:], msg.Sender)
+	hash.Write(msg.Ephemeral[:])
+	hash.Write(msg.Static[:])
+	hash.Write(msg.Timestamp[:])
+	hash.Write(sender[:])
+	var sum [blake2s.Size]byte
+	hash.Sum(sum[:0])
+	return binary.LittleEndian.Uint64(sum[:8])
 }
 
 var (
@@ -243,6 +311,14 @@ func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
 	hash.Reset()
 }
 
+// initiationDigestRingSize is how many recently consumed initiations are
+// remembered per peer. It has to cover the retransmission window
+// (RekeyAttemptTime at one initiation per RekeyTimeout is 18) with headroom for
+// jitter, reordering, and an attacker interleaving useless-but-authentic
+// traffic: an entry only falls out after this many *other* initiations were
+// consumed, so an old one cannot be pushed out cheaply.
+const initiationDigestRingSize = 32
+
 func (h *Handshake) Clear() {
 	setZero(h.localEphemeral[:])
 	setZero(h.remoteEphemeral[:])
@@ -250,6 +326,15 @@ func (h *Handshake) Clear() {
 	setZero(h.hash[:])
 	h.localIndex = 0
 	h.state = handshakeZeroed
+	// lastTimestamp, the record of consumed initiations, and lastSentTimestamp
+	// deliberately survive Clear:
+	//   - an initiation we already consumed must stay rejected even after our
+	//     handshake state is torn down (peer stop/start, key change), and the
+	//     digest of what we consumed is the only way to keep that true once an
+	//     older-but-authentic timestamp is accepted after a clock step;
+	//   - lastSentTimestamp must not rewind, or a clock step followed by a
+	//     restart of our own handshake state would make us re-emit a timestamp
+	//     the peer already has a record of.
 }
 
 func (h *Handshake) mixHash(data []byte) {
@@ -321,6 +406,21 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 		handshake.precomputedStaticStatic[:],
 	)
 	timestamp := tai64n.Now()
+	// Keep our timestamps strictly increasing even if the wall clock stepped
+	// backwards. The peer rejects anything not newer than the last initiation
+	// it consumed, so re-emitting a lower value would keep us locked out until
+	// the clock caught up (up to the step size), with no feedback but silence.
+	if !timestamp.After(handshake.lastSentTimestamp) {
+		if !handshake.clockRollbackSent {
+			handshake.clockRollbackSent = true
+			device.log.Errorf("%v - Our clock stepped backwards; handshake timestamps are now extrapolated from the last one sent so the peer does not reject them as replays", peer)
+		}
+		timestamp = handshake.lastSentTimestamp.Next()
+	} else if handshake.clockRollbackSent {
+		handshake.clockRollbackSent = false
+		device.log.Errorf("%v - Our clock has caught up with the last handshake timestamp sent; back to using the wall clock", peer)
+	}
+	handshake.lastSentTimestamp = timestamp
 	aead, _ = chacha20poly1305.New(key[:])
 	aead.Seal(msg.Timestamp[:0], ZeroNonce[:], timestamp[:], handshake.hash[:])
 
@@ -404,10 +504,16 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	// protect against replay & flood
 
-	replay := !timestamp.After(handshake.lastTimestamp)
+	fingerprint := initiationFingerprint(msg)
+	replayed := handshake.received.contains(fingerprint)
 	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
 	handshake.mutex.RUnlock()
-	if replay {
+
+	// An initiation that has been consumed before is a replay and is dropped
+	// without a reply, whether the timestamp is newer or not. That is the only
+	// case where silence is the right answer: the same datagram must not be
+	// usable twice.
+	if replayed {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
 		return nil
 	}
@@ -420,13 +526,38 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 
 	handshake.mutex.Lock()
 
+	// Re-check under the write lock: two workers may have raced on the same
+	// datagram (or on two initiations, one newer than the other).
+	if handshake.received.contains(fingerprint) {
+		handshake.mutex.Unlock()
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
+		return nil
+	}
+
 	handshake.hash = hash
 	handshake.chainKey = chainKey
 	handshake.remoteIndex = msg.Sender
 	handshake.remoteEphemeral = msg.Ephemeral
+	handshake.received.record(fingerprint)
+	reportRollback := false
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
+		if handshake.clockRollback {
+			handshake.clockRollback = false
+			device.log.Errorf("%v - Peer's handshake timestamps are ahead of the last one seen again; clock rollback over", peer)
+		}
+	} else if !handshake.clockRollback {
+		// This is the first initiation in this episode whose timestamp sits
+		// behind the high-water mark. It is cryptographically valid and has
+		// never been consumed, so the only explanation is that the peer's wall
+		// clock stepped backwards (NTP step, VM snapshot restore). Report it
+		// once, at a level an operator sees: the old behaviour was to drop these
+		// silently as replays, which left the peer retrying until it gave up.
+		handshake.clockRollback = true
+		reportRollback = true
 	}
+	// Flood accounting deliberately uses the monotonic reading behind time.Now():
+	// a stepped wall clock must not be able to disable the limiter.
 	now := time.Now()
 	if now.After(handshake.lastInitiationConsumption) {
 		handshake.lastInitiationConsumption = now
@@ -434,6 +565,10 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.state = handshakeInitiationConsumed
 
 	handshake.mutex.Unlock()
+
+	if reportRollback {
+		device.log.Errorf("%v - Peer's handshake timestamp is behind the last one seen (@ %v); accepting its new initiations so the tunnel can recover from a backwards clock step", peer, timestamp)
+	}
 
 	setZero(hash[:])
 	setZero(chainKey[:])

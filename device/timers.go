@@ -78,7 +78,13 @@ func (peer *Peer) timersActive() bool {
 
 func expiredRetransmitHandshake(peer *Peer) {
 	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+		/* This is the end of a failed handshake attempt: the peer never
+		 * answered. Report it at a level an operator sees, with the reason and
+		 * the consequence, so a silent tunnel is not mistaken for a healthy
+		 * one. (A peer whose clock stepped back is handled inside
+		 * ConsumeMessageInitiation and usually does not reach this point.)
+		 */
+		peer.device.log.Errorf("%s - Handshake did not complete after %d attempts over %d seconds; giving up and dropping queued packets", peer, MaxTimerHandshakes+2, int((RekeyAttemptTime).Seconds()))
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
